@@ -85,6 +85,14 @@ class Install(unittest.TestCase):
   r=self.run_install(env={'WORKER':'1'},image='ghcr.io/yjscms/worker7m:v1.0.0');self.assertEqual(r.returncode,0,r.stderr)
   self.assertEqual(len(r.stdout.splitlines()),4)
   backendrun=next(x for x in self.calls() if x[:1]==['run'] and x[x.index('--name')+1]!='vps-proxy-caddy');self.assertIn('RESOLVE_API_BASE=',backendrun)
+ def test_named_domains(self):
+  for flags in [ ['-zl','direct.example.com','-cf','cf.example.com'], ['-cf','cf.example.com','-zl','direct.example.com'] ]:
+   r=subprocess.run(['bash',str(self.script),*flags,'ghcr.io/yjscms/missav-proxy:v1.0.1','--local'],capture_output=True,text=True,env=self.env)
+   self.assertEqual(r.returncode,0,r.stderr);self.assertIn('http://cf.example.com',self.config())
+ def test_bad_named_domains(self):
+  for flags in [ ['-zl'], ['-cf','cf.example.com'], ['-zl','direct.example.com','-zl','other.example.com','-cf','cf.example.com'], ['-zl','-cf','cf.example.com'] ]:
+   r=subprocess.run(['bash',str(self.script),*flags,'missav:test'],capture_output=True,text=True,env=self.env)
+   self.assertNotEqual(r.returncode,0);self.assertFalse((self.p/'calls').exists())
  def test_invalid_domains(self):
   r=subprocess.run(['bash',str(self.script),'same.example.com','same.example.com','missav:test'],capture_output=True,text=True,env=self.env);self.assertNotEqual(r.returncode,0);self.assertFalse((self.p/'calls').exists())
 if __name__=='__main__':unittest.main()
