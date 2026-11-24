@@ -7,10 +7,10 @@ die() { info "$*"; exit 1; }
 
 usage() {
     cat <<'EOF'
-用法: sudo bash install.sh -zl 直连域名 -cf CF域名 镜像 [--service missav|worker7m|supjav]
+用法: sudo bash install.sh -zl 直连域名 -cf CF域名 镜像 [--service missav|worker7m|supjav|library]
 兼容: sudo bash install.sh 直连域名 CF域名 镜像
 兼容: sudo bash install.sh 直连域名 镜像（升级时保留已有 CF 入口）
-                          [--port 端口] [--env-file 文件] [--local]
+                          [--upstream https://仓库域名] [--port 端口] [--env-file 文件] [--local]
                           [--registry-user GitHub用户名]
                           [--verify-path /路径 --verify-body 预期文本]
 
@@ -21,6 +21,7 @@ worker7m 默认本机解析，不填写远程计算核心。标准输出只有�
 --local 使用 VPS 上已有的镜像。默认从镜像仓库拉取。
 --registry-user 在安装 Docker 后提示输入私有 GHCR 的令牌。
 --verify-path 和 --verify-body 一起使用，增加真实业务请求验收。
+library 使用 caddy:2-alpine；必须提供 /v/.../index.m3u8 验收路径，默认回源 80stor-cf.23m3u.top。
 EOF
 }
 
@@ -54,13 +55,14 @@ else
     image=$2
     shift 2
 fi
-service= port= env_file= verify_path= verify_body= registry_user= local_image=0
+service= port= env_file= verify_path= verify_body= registry_user= upstream= local_image=0
 while (( $# )); do
     case $1 in
         --local) local_image=1; shift; continue ;;
-        --service|--port|--env-file|--verify-path|--verify-body|--registry-user)
+        --service|--port|--env-file|--verify-path|--verify-body|--registry-user|--upstream)
             (( $# >= 2 )) && [[ -n $2 ]] || die "$1 缺少参数"
             case $1 in
+                --upstream) upstream=$2 ;;
                 --service) service=$2 ;;
                 --port) port=$2 ;;
                 --env-file) env_file=$2 ;;
@@ -109,14 +111,29 @@ case $service in
         probe_body='"error"[[:space:]]*:[[:space:]]*"missing_link"'
         node_path=/su/
         ;;
+    library)
+        port=${port:-8080}
+        probe_path=/healthz
+        probe_status=200
+        probe_body='"service":"library"'
+        upstream=${upstream:-https://80stor-cf.23m3u.top}
+        upstream=${upstream%/}
+        [[ $image == caddy:2-alpine ]] || die 'library 模式使用 caddy:2-alpine 官方镜像'
+        [[ $upstream =~ ^https://($label\.)+$label$ && ${upstream##*.} =~ [a-z] ]] || die '--upstream 必须为 HTTPS 域名，不含路径、端口或参数'
+        upstream_host=${upstream#https://}
+        [[ $upstream_host != "$domain" && $upstream_host != "$cf_domain" ]] || die '仓库回源域名不能与新入口相同，以免循环回源'
+        [[ $verify_path == /v/*.m3u8* ]] || die 'library 模式请提供 --verify-path /v/.../index.m3u8 进行真实清单验收'
+        [[ -n $verify_body ]] || verify_body='#EXTM3U'
+        ;;
     supjav)
         port=${port:-8789}
         probe_path='/?status'
         probe_status=200
         probe_body='"status"[[:space:]]*:[[:space:]]*"ok"'
         ;;
-    *) die '--service 必须是 missav、worker7m 或 supjav' ;;
+    *) die '--service 必须是 missav、worker7m、supjav 或 library' ;;
 esac
+[[ $service == library || -z $upstream ]] || die '--upstream 仅适用于 library 仓库反代'
 [[ $port =~ ^[1-9][0-9]{0,4}$ ]] && (( port <= 65535 )) || die '容器端口无效'
 [[ -z $env_file || -r $env_file ]] || die '无法读取 --env-file'
 if [[ -n $verify_path || -n $verify_body ]]; then
@@ -160,6 +177,9 @@ if [[ -z $cf_domain && -f $site ]]; then
 fi
 if [[ -n $cf_domain ]]; then
     [[ ${#cf_domain} -le 253 && $cf_domain =~ ^($label\.)+$label$ && ${cf_domain##*.} =~ [a-z] && $cf_domain != "$domain" ]] || die '已保存 CF 域名无效'
+fi
+if [[ $service == library && $upstream_host == "$cf_domain" ]]; then
+    die '仓库回源域名不能与已有 CF 入口相同，以免循环回源'
 fi
 for hostname in "$domain" ${cf_domain:+"$cf_domain"}; do
     getent ahosts "$hostname" >/dev/null || die "DNS 尚未解析到域名 $hostname"
@@ -216,6 +236,7 @@ work=$(mktemp -d "$state/install.XXXXXXXXXXXX")
 release=${work##*.}
 backend=vps-proxy-$release
 old_backend=
+backend_config=$state/backends/$backend.caddy
 published=0
 started=0
 reload_gateway() {
@@ -241,7 +262,7 @@ cleanup() {
                 return "$result"
             fi
         fi
-        docker rm -f "$backend" >/dev/null 2>&1 || true
+        if docker rm -f "$backend" >/dev/null 2>&1; then rm -f "$backend_config"; fi
     fi
     rm -rf "$work"
     return "$result"
@@ -285,6 +306,64 @@ if [[ $service == worker7m ]]; then
 fi
 if [[ $service == missav || $service == worker7m ]]; then
     container_options+=(--env "PORT=$port")
+fi
+if [[ $service == library ]]; then
+    mkdir -p "$state/backends"
+    cat >"$backend_config" <<EOF
+{
+    admin off
+    auto_https off
+}
+:$port {
+    header {
+        Access-Control-Allow-Origin "*"
+        Access-Control-Allow-Methods "GET, HEAD, OPTIONS"
+        Access-Control-Allow-Headers "Range, Origin, Accept, Content-Type"
+        Access-Control-Expose-Headers "Content-Length, Content-Range, Accept-Ranges"
+    }
+    route {
+        @preflight method OPTIONS
+        respond @preflight 204
+        handle /healthz {
+            header Cache-Control "no-store"
+            respond \`{"ok":true,"service":"library"}\` 200
+        }
+        handle /v/* {
+            reverse_proxy $upstream {
+                header_up Host $upstream_host
+                header_up User-Agent "Mozilla/5.0"
+                header_up Accept-Encoding "identity;q=1, *;q=0"
+                header_down -Access-Control-Allow-Origin
+                header_down -Access-Control-Allow-Methods
+                header_down -Access-Control-Allow-Headers
+                header_down -Access-Control-Expose-Headers
+                transport http {
+                    compression off
+                    dial_timeout 10s
+                    response_header_timeout 60s
+                }
+                @failure status 3xx 4xx 5xx
+                handle_response @failure {
+                    header Cache-Control "no-store"
+                    copy_response_headers {
+                        exclude Cache-Control Expires Access-Control-Allow-Origin Access-Control-Allow-Methods Access-Control-Allow-Headers Access-Control-Expose-Headers
+                    }
+                    copy_response
+                }
+            }
+        }
+        handle {
+            header Cache-Control "no-store"
+            respond "Not found" 404
+        }
+    }
+    handle_errors {
+        header Cache-Control "no-store"
+        respond "Upstream unavailable" {err.status_code}
+    }
+}
+EOF
+    container_options+=(--mount "type=bind,source=$backend_config,target=/etc/caddy/Caddyfile,readonly")
 fi
 logging=(--log-driver local --log-opt max-size=5m --log-opt max-file=2)
 docker run -d --name "$backend" --label "$owner=$domain" --restart unless-stopped \
@@ -409,7 +488,9 @@ if [[ $old_backend =~ ^vps-proxy-[a-zA-Z0-9]+$ &&
     if grep -Fq "reverse_proxy $old_backend:" "$state"/sites/*.caddy; then
         info '旧容器仍被其他入口引用，保留；请用双域名命令接管旧 CF 别名'
     else
-        docker rm -f "$old_backend" >/dev/null || info "旧容器 $old_backend 清理失败"
+        if docker rm -f "$old_backend" >/dev/null; then
+            rm -f "$state/backends/$old_backend.caddy"
+        else info "旧容器 $old_backend 清理失败"; fi
     fi
 fi
 printf 'VPS|https://%s%s|stable\n' "$domain" "$node_path"
