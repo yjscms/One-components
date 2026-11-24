@@ -9,8 +9,8 @@ Debian/Ubuntu、root、Linux amd64。一个业务容器同时提供直连 HTTPS 
 - 放行 TCP 80/443，端口由 Caddy 管理。脚本不会修改 Cloudflare 配置。
 
 ```bash
-bash install.sh miss10.example.com miss11.example.com ghcr.io/yjscms/missav-proxy:v1.0.1
-bash install.sh seven-direct.example.com seven-cf.example.com ghcr.io/yjscms/worker7m:v1.0.0
+bash install.sh -zl miss10.example.com -cf miss11.example.com ghcr.io/yjscms/missav-proxy:v1.0.1
+bash install.sh -zl seven-direct.example.com -cf seven-cf.example.com ghcr.io/yjscms/worker7m:v1.0.0
 ```
 
 直连入口由 Caddy 自动签发证书。CF 入口仅提供 HTTP，不强制跳 HTTPS，并向应用传入 HTTPS 协议信息，避免清单生成 HTTP 播放链接。两个入口复用一个业务容器，不按线路名称区分角色。
@@ -21,7 +21,7 @@ Missav 的 Web 后台核心节点继续负责列表、搜索和详情，本脚�
 
 ## 更新与回滚
 
-同一对域名、同一个或新版本镜像重跑即可。域名与新容器路由在同一配置文件中统一更新。兼容旧的 `直连域名 镜像` 两参数命令：已绑定的 CF 域名会从配置中恢复，不会在更新时丢失。
+同一对域名、同一个或新版本镜像重跑即可。`-zl` 和 `-cf` 放在镜像前，两者顺序可以交换；旧的双域名位置参数形式仍兼容。域名与新容器路由在同一配置文件中统一更新。兼容旧的 `直连域名 镜像` 两参数命令：已绑定的 CF 域名会从配置中恢复，不会在更新时丢失。
 
 之前通过手工别名脚本添加的入口，首次请传入两个域名。脚本仅在别名标记、主域名与旧后端全部匹配时接管；不覆盖其他服务的域名。发现其他入口仍引用旧容器时保留旧容器，避免旧别名失效。
 
@@ -30,7 +30,7 @@ Missav 的 Web 后台核心节点继续负责列表、搜索和详情，本脚�
 `/healthz` 或缺少参数的 API 响应不能证明视频可播。可以指定一部已知可用影片做两条公开入口的清单验收：
 
 ```bash
-bash install.sh miss10.example.com miss11.example.com ghcr.io/yjscms/missav-proxy:v1.0.1 \
+bash install.sh -zl miss10.example.com -cf miss11.example.com ghcr.io/yjscms/missav-proxy:v1.0.1 \
   --verify-path /9211af04-5ad2-4ae6-9112-139ee3926607/playlist.m3u8 --verify-body '#EXTM3U'
 ```
 

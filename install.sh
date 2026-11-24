@@ -7,7 +7,8 @@ die() { info "$*"; exit 1; }
 
 usage() {
     cat <<'EOF'
-用法: sudo bash install.sh 直连域名 CF域名 镜像 [--service missav|worker7m|supjav]
+用法: sudo bash install.sh -zl 直连域名 -cf CF域名 镜像 [--service missav|worker7m|supjav]
+兼容: sudo bash install.sh 直连域名 CF域名 镜像
 兼容: sudo bash install.sh 直连域名 镜像（升级时保留已有 CF 入口）
                           [--port 端口] [--env-file 文件] [--local]
                           [--registry-user GitHub用户名]
@@ -26,6 +27,21 @@ EOF
 if [[ ${1:-} == --help || ${1:-} == -h ]]; then
     usage
     exit 0
+fi
+# 显式双域名参数；保留原位置参数形式，避免影响已有升级命令。
+if [[ ${1:-} == -zl || ${1:-} == -cf ]]; then
+    direct_arg= cf_arg=
+    while [[ ${1:-} == -zl || ${1:-} == -cf ]]; do
+        (( $# >= 2 )) && [[ -n $2 && $2 != -* ]] || die "$1 缺少域名"
+        case $1 in
+            -zl) [[ -z $direct_arg ]] || die '-zl 不能重复'; direct_arg=$2 ;;
+            -cf) [[ -z $cf_arg ]] || die '-cf 不能重复'; cf_arg=$2 ;;
+        esac
+        shift 2
+    done
+    [[ -n $direct_arg && -n $cf_arg && $# -ge 1 && $1 != -* ]] ||
+        die '请提供 -zl 直连域名 -cf CF域名 镜像'
+    set -- "$direct_arg" "$cf_arg" "$@"
 fi
 (( $# >= 2 )) || { usage >&2; exit 2; }
 domain=$(printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]')
