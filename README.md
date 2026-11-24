@@ -46,3 +46,32 @@ python3 -m unittest discover -s test -v
 ```
 
 测试在临时目录中模拟 Docker、curl、DNS；覆盖双入口、升级保留 CF、旧手工别名接管、失败回滚、不覆盖其他站点、worker7m 本机解析及单域名兼容。不会连接真实 Docker、CF 或生产服务器。这不代替 VPS 上的真实部署验收。
+
+## 80T / 17C 仓库双域名反代（v1.3.0）
+
+复用官方 `caddy:2-alpine`，新建一个仓库反代容器，不构建额外镜像。直连与橙云入口沿用同一套双域名部署/回滚流程，不影响同机 Missav、worker7m。
+
+```bash
+bash install.sh -zl stor-direct.example.com -cf stor-cf.example.com caddy:2-alpine \
+  --service library --upstream https://80stor-cf.23m3u.top \
+  --verify-path '/v/k1/有效签名/d1/ABC/ABC-001/index.m3u8'
+```
+
+验收路径必须换成一条当前可播放的 17C m3u8 地址的路径，可从现有播放器复制完整地址后取 `/v/` 开始的部分；不填写私有签名密钥。Web 后台「17C 本地库 → VPS 一键部署」可直接粘贴完整链接并生成命令。library 自动检查正文 `#EXTM3U`，不接受只用健康检查替代真实清单验收。
+
+- 固定 HTTPS 回源域名；原 `/v/...` 路径、签名、查询参数、Range 与清单正文保持不变。现有相对分片地址继续使用访问入口的域名。
+- 默认走 `80stor-cf.23m3u.top`，利用该入口的 CF 缓存；新 CF 域名仍设橙云、灵活 SSL。上游不能配置成本次两个入口之一。
+- 不保存签名密钥，不做视频磁盘缓存；只保存每个容器的反代配置。Docker 日志保留 2 × 5 MB。
+- 明确请求 identity 并关闭回源自动解压，不删除 Content-Encoding；保留源响应语义，避免旧反代的压缩错误。TLS 正常校验证书。
+- 仅提供 `/healthz` 和 `/v/*`，支持跨域预检；4xx/5xx 禁止缓存，成功响应保留上游缓存策略。不清理 CF 已有缓存。
+- 更新时新配置独立保存，候选及双入口验收通过后清理旧容器和不再使用的配置；失败恢复旧路由，不删除旧配置。
+
+脚本完成只说明清单验收通过，分片、播放画面、CF 命中率及用户网络需实际验收。不会自动修改 17C 后台的播放域名前缀。
+
+额外的本机 Caddy 集成测试（使用本机 HTTP 假上游，不连接生产）：
+
+```bash
+CADDY_BIN=/path/to/caddy python3 -m unittest discover -s test -v
+```
+
+2026-11-24 验证：13 项测试通过（含实际 Caddy 程序测试）；隔离监听端口读取既有 80T 资源，取得有效清单和 TS 分片。未向生产 VPS 部署、改 DNS 或修改 80T 数据。

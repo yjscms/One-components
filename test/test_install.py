@@ -30,6 +30,9 @@ if name=='curl':
  url=next(x for x in a if x.startswith(('http://','https://')));status='400';body='{"error":"missing_key"}'
  if os.environ.get('WORKER'):
   status='200';body='{"error":"missing_link"}'
+ if os.environ.get('LIBRARY'):
+  status='200';body='{"ok":true,"service":"library"}'
+ if '/v/' in url:status='200';body='#EXTM3U\n#EXTINF:4,\nsegment.webp\n'
  if '/real-play' in url:status='200';body='#EXTM3U\n#EXTINF:4,\nhttps://cf.example.com/segment.jpeg\n'
  if os.environ.get('FAIL_CF') and url.startswith('https://cf.example.com'):status='502';body='failed'
  cfg=(p/'state/sites/direct.example.com.caddy')
@@ -93,6 +96,20 @@ class Install(unittest.TestCase):
   for flags in [ ['-zl'], ['-cf','cf.example.com'], ['-zl','direct.example.com','-zl','other.example.com','-cf','cf.example.com'], ['-zl','-cf','cf.example.com'] ]:
    r=subprocess.run(['bash',str(self.script),*flags,'missav:test'],capture_output=True,text=True,env=self.env)
    self.assertNotEqual(r.returncode,0);self.assertFalse((self.p/'calls').exists())
+ def test_library_dual_upgrade_and_rollback(self):
+  extra=['--service','library','--upstream','https://origin.example.com','--verify-path','/v/k1/fixture/d1/ABF/ABF-001/index.m3u8?x=1']
+  r=self.run_install(env={'LIBRARY':'1'},image='caddy:2-alpine',extra=extra);self.assertEqual(r.returncode,0,r.stderr)
+  before=self.config();backends=list((self.p/'state/backends').glob('*.caddy'));self.assertEqual(len(backends),1);config=backends[0].read_text()
+  for text in ['reverse_proxy https://origin.example.com','header_up Host origin.example.com','identity;q=1, *;q=0','compression off','@failure status 3xx 4xx 5xx','copy_response','handle /v/*']:
+   self.assertIn(text,config)
+  self.assertNotIn('tls_insecure_skip_verify',config);self.assertNotIn('encode gzip',config)
+  r=self.run_install(env={'LIBRARY':'1','FAIL_CF':'1'},image='caddy:2-alpine',extra=extra);self.assertNotEqual(r.returncode,0)
+  self.assertEqual(self.config(),before);self.assertEqual(list((self.p/'state/backends').glob('*.caddy')),backends)
+  r=self.run_install(env={'LIBRARY':'1'},image='caddy:2-alpine',extra=extra);self.assertEqual(r.returncode,0,r.stderr)
+  self.assertFalse(backends[0].exists());self.assertEqual(len(list((self.p/'state/backends').glob('*.caddy'))),1)
+ def test_library_rejects_bad_upstream_and_missing_media(self):
+  for extra in [ ['--service','library'], ['--service','library','--verify-path','/healthz'], ['--service','library','--verify-path','/v/a/index.m3u8','--upstream','https://direct.example.com'], ['--service','library','--verify-path','/v/a/index.m3u8','--upstream','https://cf.example.com'], ['--service','library','--verify-path','/v/a/index.m3u8','--upstream','https://bad.example.com/;id'] ]:
+   r=self.run_install(env={'LIBRARY':'1'},image='caddy:2-alpine',extra=extra);self.assertNotEqual(r.returncode,0);self.assertFalse((self.p/'calls').exists())
  def test_invalid_domains(self):
   r=subprocess.run(['bash',str(self.script),'same.example.com','same.example.com','missav:test'],capture_output=True,text=True,env=self.env);self.assertNotEqual(r.returncode,0);self.assertFalse((self.p/'calls').exists())
 if __name__=='__main__':unittest.main()
