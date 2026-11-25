@@ -21,6 +21,7 @@ worker7m 默认本机解析，不填写远程计算核心。标准输出只有�
 --local 使用 VPS 上已有的镜像。默认从镜像仓库拉取。
 --registry-user 在安装 Docker 后提示输入私有 GHCR 的令牌。
 --verify-path 和 --verify-body 一起使用，增加真实业务请求验收。
+默认自动配置支持的 BBR；--restart-gateway-for-bbr 允许重启已有共享入口使 BBR 生效。
 library 使用 caddy:2-alpine；必须提供 /v/.../index.m3u8 验收路径，默认回源 80stor-cf.23m3u.top。
 EOF
 }
@@ -56,9 +57,11 @@ else
     shift 2
 fi
 service= port= env_file= verify_path= verify_body= registry_user= upstream= local_image=0
+restart_gateway_bbr=0
 while (( $# )); do
     case $1 in
         --local) local_image=1; shift; continue ;;
+        --restart-gateway-for-bbr) restart_gateway_bbr=1; shift; continue ;;
         --service|--port|--env-file|--verify-path|--verify-body|--registry-user|--upstream)
             (( $# >= 2 )) && [[ -n $2 ]] || die "$1 缺少参数"
             case $1 in
@@ -146,6 +149,7 @@ packages=()
 command -v docker >/dev/null || packages+=(docker.io)
 command -v curl >/dev/null || packages+=(curl ca-certificates)
 command -v flock >/dev/null || packages+=(util-linux)
+command -v sysctl >/dev/null || packages+=(procps)
 if [[ -r /sys/module/apparmor/parameters/enabled ]] &&
     grep -qx Y /sys/module/apparmor/parameters/enabled &&
     ! command -v apparmor_parser >/dev/null; then
@@ -213,6 +217,28 @@ if [[ $(docker container inspect -f '{{.State.Running}}' "$gateway" 2>/dev/null 
     info "$occupied_ports"
     die '80 或 443 已有监听服务。请先确认现有入口的用途，再决定如何部署 Caddy'
 fi
+# BBR is best-effort: never replace a kernel or silently restart a shared gateway.
+bbr_options=()
+bbr_host=0
+command -v modprobe >/dev/null && modprobe tcp_bbr 2>/dev/null || true
+if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+    if sysctl -w net.core.default_qdisc=fq net.ipv4.tcp_congestion_control=bbr >&2; then
+        bbr_host=1
+        mkdir -p /etc/sysctl.d
+        printf '%s\n' 'net.core.default_qdisc = fq' 'net.ipv4.tcp_congestion_control = bbr' > /etc/sysctl.d/99-vps-proxy-bbr.conf
+        bbr_options=(--sysctl net.ipv4.tcp_congestion_control=bbr)
+        info '[BBR] 宿主机已启用并保存；新业务容器和新 Caddy 显式使用 BBR'
+    else
+        info '[BBR] 当前系统不允许应用 BBR，继续安装并保留原算法'
+    fi
+else
+    info '[BBR] 当前内核未提供 BBR，保留原算法；不会更换内核'
+fi
+if (( bbr_host && restart_gateway_bbr )) && docker container inspect "$gateway" >/dev/null 2>&1; then
+    saved_cc=$(docker inspect -f '{{index .HostConfig.Sysctls "net.ipv4.tcp_congestion_control"}}' "$gateway")
+    [[ $saved_cc != cubic && $saved_cc != reno ]] || die '旧 Caddy 显式固定了其他算法，需另行重建入口；本次不覆盖其启动参数'
+fi
+
 if docker network inspect "$network" >/dev/null 2>&1; then
     [[ $(docker network inspect -f "{{ index .Labels \"$owner\" }}" "$network") == gateway ]] ||
         die "网络名 $network 已被占用"
@@ -298,7 +324,7 @@ if [[ -f $site ]]; then
     read -r _ old_backend <"$work/previous"
 fi
 
-container_options=(--network "$network")
+container_options=(--network "$network" ${bbr_options[@]+"${bbr_options[@]}"})
 [[ -z $env_file ]] || container_options+=(--env-file "$env_file")
 if [[ $service == worker7m ]]; then
     # 此安装入口统一部署独立解析节点，覆盖镜像和 env-file 中的旧远程地址。
@@ -409,6 +435,10 @@ fi
 mv -f "$work/site" "$site"
 if docker container inspect "$gateway" >/dev/null 2>&1; then
     docker start "$gateway" >/dev/null
+    if (( bbr_host && restart_gateway_bbr )); then
+        info '[BBR] 按显式参数重启共享 Caddy，本站全部播放入口将短暂中断'
+        docker restart "$gateway" >/dev/null
+    fi
     for attempt in {1..5}; do
         if reload_gateway; then
             break
@@ -419,7 +449,7 @@ if docker container inspect "$gateway" >/dev/null 2>&1; then
 else
     started=1
     docker run -d --name "$gateway" --label "$owner=gateway" --restart unless-stopped \
-        --network "$network" --publish 80:80 --publish 443:443 "${logging[@]}" \
+        --network "$network" ${bbr_options[@]+"${bbr_options[@]}"} --publish 80:80 --publish 443:443 "${logging[@]}" \
         --mount "type=bind,source=$state/Caddyfile,target=/etc/caddy/Caddyfile,readonly" \
         --mount "type=bind,source=$state/sites,target=/etc/caddy/sites,readonly" \
         --mount type=volume,source=vps-proxy-caddy-data,target=/data \
@@ -479,6 +509,18 @@ if [[ -n $cf_domain ]]; then
     if [[ -n $verify_path ]]; then
         probe_cf "$verify_path" 200 60 "https://$cf_domain" && grep -Fq -- "$verify_body" "$work/body" ||
             die "CF 真实业务请求验收失败：$probe_error"
+    fi
+fi
+if (( bbr_host )); then
+    backend_cc=$(docker exec "$backend" cat /proc/sys/net/ipv4/tcp_congestion_control) || die '无法核对业务容器拥塞算法'
+    [[ $backend_cc == bbr ]] || die '业务容器未实际启用 BBR，本次部署回滚'
+    gateway_cc=$(docker exec "$gateway" cat /proc/sys/net/ipv4/tcp_congestion_control) || die '无法核对 Caddy 拥塞算法'
+    if [[ $gateway_cc == bbr ]]; then
+        info '[BBR] 已核对：宿主机、业务容器、Caddy 均为 bbr'
+    elif (( restart_gateway_bbr )); then
+        die '入口重启后仍未使用 BBR，本次部署回滚'
+    else
+        info "[BBR] 注意：现有 Caddy 仍为 ${gateway_cc}，入口 BBR 未生效。可在维护窗口加 --restart-gateway-for-bbr 重跑；将短暂中断本机全部播放入口"
     fi
 fi
 info 'VPS 侧双入口验收完成。浏览器播放和不同用户网络仍需实测'
