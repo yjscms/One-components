@@ -75,3 +75,19 @@ CADDY_BIN=/path/to/caddy python3 -m unittest discover -s test -v
 ```
 
 2026-11-24 验证：13 项测试通过（含实际 Caddy 程序测试）；隔离监听端口读取既有 80T 资源，取得有效清单和 TS 分片。未向生产 VPS 部署、改 DNS 或修改 80T 数据。
+
+## 自动 BBR（v1.4.0）
+
+安装时尝试加载内核已有的 tcp_bbr。支持且系统允许时，设置宿主机 `net.ipv4.tcp_congestion_control=bbr`、默认队列 `fq`，保存到 `/etc/sysctl.d/99-vps-proxy-bbr.conf`。这只是默认队列设置，不声称已经替换现有物理网卡队列。不下载、更换内核，不调大内存缓冲区。
+
+新业务容器与新 Caddy 都显式传入 `--sysctl net.ipv4.tcp_congestion_control=bbr`。安装结束检查容器实际值，避免宿主机已开启但容器仍为 cubic。内核不支持或宿主机权限不足时，明确提示并继续安装，不标称 BBR 已生效。BBR 宿主机配置独立持久保存，后续业务部署失败回滚只恢复业务路由，不撤销该宿主机配置。
+
+已有共享 Caddy 默认不重启：若仍使用 cubic，会报告“入口 BBR 未生效”。维护窗口可在原命令末尾增加：
+
+```text
+--restart-gateway-for-bbr
+```
+
+该参数会短暂中断本机所有播放入口，仅重启受本安装器管理的 Caddy，不重启 Docker 或其他业务容器。若旧容器已显式固定 cubic/reno，停止并要求另行迁移，不擅自覆盖其启动参数。重启后仍非 BBR，恢复本次部署的旧路由并报告失败。
+
+一键脚本支持不代表直连一定达到端口标称速率；新 VPS 仍需同一网络下实测起播、拖动和持续传输。

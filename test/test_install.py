@@ -5,16 +5,25 @@ MOCK = r'''#!/usr/bin/env python3
 import sys,os,json,pathlib
 p=pathlib.Path(os.environ['FIXTURE']);name=pathlib.Path(sys.argv[0]).name;a=sys.argv[1:]
 def out(x):print(x);sys.exit(0)
+if name=='sysctl':
+ if '-n' in a:out('reno cubic bbr' if os.environ.get('BBR') else 'reno cubic')
+ sys.exit(1 if os.environ.get('SYSCTL_FAIL') else 0)
+if name=='modprobe':sys.exit(0)
 if name=='getent':out('127.0.0.1')
 if name in ('ss','sleep','apparmor_parser','flock'):sys.exit(0)
 if name=='docker':
  with (p/'calls').open('a') as f:f.write(json.dumps(a)+'\n')
+ if a and a[0]=='restart':(p/'restarted').touch();sys.exit(0)
+ if a[:1]==['exec'] and '/proc/sys/net/ipv4/tcp_congestion_control' in a:
+  if os.environ.get('BAD_BACKEND') and a[1]!='vps-proxy-caddy':out('cubic')
+  out('cubic' if a[1]=='vps-proxy-caddy' and os.environ.get('GATEWAY_CUBIC') and not (p/'restarted').exists() else 'bbr')
  if a[:2]==['image','inspect']:out('sha256:fixture')
  if a[:2]==['network','inspect']:
   if '-f' in a:out('gateway')
   sys.exit(0)
  if a[:2]==['container','inspect'] or (a and a[0]=='inspect'):
   target=a[-1]
+  if os.environ.get('SAVED_CUBIC') and any('.HostConfig.Sysctls' in x for x in a):out('cubic')
   if target=='vps-proxy-caddy':
    if not (p/'gateway').exists():sys.exit(1)
    out('gateway' if a[0]=='inspect' else 'true')
@@ -48,9 +57,10 @@ class Install(unittest.TestCase):
  def setUp(self):
   self.tmp=tempfile.TemporaryDirectory();self.p=pathlib.Path(self.tmp.name);(self.p/'bin').mkdir()
   script=(ROOT/'install.sh').read_text().replace('state=/opt/vps-proxy','state='+str(self.p/'state'))
+  script=script.replace('/etc/sysctl.d',str(self.p/'sysctl.d'))
   script=script.replace('[[ $OSTYPE == linux* && $EUID == 0 ]]', '[[ 1 == 1 ]]').replace('SECONDS + 180','SECONDS + 0').replace('SECONDS + 30','SECONDS + 0')
   self.script=self.p/'install.sh';self.script.write_text(script)
-  for name in ['docker','curl','getent','ss','sleep','apparmor_parser','flock']:
+  for name in ['docker','curl','getent','ss','sleep','apparmor_parser','flock','sysctl','modprobe']:
    f=self.p/'bin'/name;f.write_text(MOCK);f.chmod(0o700)
   self.env=dict(os.environ,PATH=str(self.p/'bin')+':'+os.environ['PATH'],FIXTURE=str(self.p))
  def tearDown(self):self.tmp.cleanup()
@@ -110,6 +120,26 @@ class Install(unittest.TestCase):
  def test_library_rejects_bad_upstream_and_missing_media(self):
   for extra in [ ['--service','library'], ['--service','library','--verify-path','/healthz'], ['--service','library','--verify-path','/v/a/index.m3u8','--upstream','https://direct.example.com'], ['--service','library','--verify-path','/v/a/index.m3u8','--upstream','https://cf.example.com'], ['--service','library','--verify-path','/v/a/index.m3u8','--upstream','https://bad.example.com/;id'] ]:
    r=self.run_install(env={'LIBRARY':'1'},image='caddy:2-alpine',extra=extra);self.assertNotEqual(r.returncode,0);self.assertFalse((self.p/'calls').exists())
+ def test_bbr_supported_and_persisted(self):
+  r=self.run_install(env={'BBR':'1'});self.assertEqual(r.returncode,0,r.stderr)
+  self.assertIn('Caddy 均为 bbr',r.stderr)
+  self.assertIn('tcp_congestion_control = bbr',(self.p/'sysctl.d/99-vps-proxy-bbr.conf').read_text())
+  for call in [c for c in self.calls() if c[:1]==['run']]:self.assertIn('net.ipv4.tcp_congestion_control=bbr',call)
+ def test_bbr_existing_gateway_not_implicitly_restarted(self):
+  self.assertEqual(self.run_install().returncode,0)
+  r=self.run_install(env={'BBR':'1','GATEWAY_CUBIC':'1'});self.assertEqual(r.returncode,0,r.stderr)
+  self.assertIn('入口 BBR 未生效',r.stderr);self.assertFalse((self.p/'restarted').exists())
+  r=self.run_install(env={'BBR':'1','GATEWAY_CUBIC':'1'},extra=['--restart-gateway-for-bbr']);self.assertEqual(r.returncode,0,r.stderr);self.assertTrue((self.p/'restarted').exists());self.assertIn('Caddy 均为 bbr',r.stderr)
+ def test_bbr_unavailable_or_denied(self):
+  for env in [{},{'BBR':'1','SYSCTL_FAIL':'1'}]:
+   r=self.run_install(env=env);self.assertEqual(r.returncode,0,r.stderr)
+   self.assertFalse((self.p/'sysctl.d/99-vps-proxy-bbr.conf').exists())
+ def test_bbr_backend_verification_failure_rolls_back(self):
+  self.assertEqual(self.run_install().returncode,0);before=self.config()
+  r=self.run_install(env={'BBR':'1','BAD_BACKEND':'1'});self.assertNotEqual(r.returncode,0);self.assertEqual(self.config(),before)
+ def test_bbr_does_not_overwrite_pinned_legacy_gateway(self):
+  self.assertEqual(self.run_install().returncode,0);before=self.config()
+  r=self.run_install(env={'BBR':'1','SAVED_CUBIC':'1'},extra=['--restart-gateway-for-bbr']);self.assertNotEqual(r.returncode,0);self.assertEqual(self.config(),before);self.assertFalse((self.p/'restarted').exists())
  def test_invalid_domains(self):
   r=subprocess.run(['bash',str(self.script),'same.example.com','same.example.com','missav:test'],capture_output=True,text=True,env=self.env);self.assertNotEqual(r.returncode,0);self.assertFalse((self.p/'calls').exists())
 if __name__=='__main__':unittest.main()
